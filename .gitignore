@@ -99,3 +99,7 @@ ENV/
 
 # mypy
 .mypy_cache/
+
+# password file
+*.pwfile_
+
