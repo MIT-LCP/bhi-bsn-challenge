@@ -1,0 +1,309 @@
+---
+title: "R Demo for the 2018 BHI & BSN Data Challenge"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+# R Demo for the 2018 BHI & BSN Data Challenge
+
+The toughest part is often getting the database running and the software connecting to it. This is the way I usually do it:
+
+    run echo 'password' > .pwfile_ in a command prompt, where password is replaced with your user's postgres password
+    Run this script in the same directory as this file
+
+The resulting chunk may install some R packages on your computer.
+
+
+```{r}
+if(!("dplyr" %in% installed.packages()) |!("dbplyr" %in% installed.packages()) | !("RPostgreSQL" %in% installed.packages()))  { 
+    install.packages(c("dplyr","dbplyr","RPostgreSQL"))
+}
+
+                     
+library(dplyr); library(dbplyr); library(RPostgreSQL); library(DBI)
+
+# Create a database connection
+user <- 'postgres'
+host <- 'localhost'
+dbname <- 'mimic'
+schema <- 'mimiciii,public'
+port <- 5434
+passwd <- readLines("~/.pwfile_")
+
+pg_src <- src_postgres(dbname = dbname, 
+                       host = host, port = port, 
+                       user = user, password = passwd,
+                       options=paste0("-c search_path=", schema))
+
+m <- dbDriver("PostgreSQL")
+con <- dbConnect(m, user=user, password=passwd, dbname=dbname,host=host,port=port) # The trickiest parts
+dbSendStatement(con,paste0("SET search_path TO ",schema))
+
+```
+
+```{r}
+
+# Run query and assign the results to a DataFrame
+# Requires the icustay_detail view from:
+# https://github.com/MIT-LCP/mimic-code/tree/master/concepts/demographics
+
+
+# To get these views, the following may work (uncomment to run):
+## NOTE:
+## This will overwrite old views on your machine if you had already created them.
+## If you have them already, you likely do not need to run this code!.
+## This will take a while, possibly several hours, depending on the speed of your computer/network
+#
+#
+## if(!("MIMICutil" %in% installed.packages())) { devtools::install_github("jraffa/MIMICutil") }
+## 
+## library(MIMICutil); library(RPostgreSQL)
+## v <- get_views(URLlist="https://raw.githubusercontent.com/jraffa/MIMICutil/master/mat_view_urls_working",dplyrDB=pg_src,con=con)
+
+###
+
+
+
+query = "
+WITH first_icu AS (
+    SELECT i.subject_id, i.hadm_id, i.icustay_id, i.gender, i.admittime admittime_hospital, 
+      i.dischtime dischtime_hospital, i.los_hospital, i.age, i.admission_type, 
+      i.hospital_expire_flag, i.intime intime_icu, i.outtime outtime_icu, i.los_icu, 
+      s.first_careunit
+    FROM icustay_detail i
+    LEFT JOIN icustays s
+    ON i.icustay_id = s.icustay_id
+    WHERE i.hospstay_seq = 1
+      AND i.icustay_seq = 1
+      AND i.age >= 16
+)
+SELECT f.*, o.icustay_expire_flag, o.oasis, o.oasis_prob
+FROM first_icu f
+LEFT JOIN oasis o
+ON f.icustay_id = o.icustay_id;
+"
+
+rs <- dbSendQuery(con,query)
+dat <- dbFetch(rs)
+
+# or using dplyr:
+# uncomment below
+#
+## icustay_detail_tbl <- tbl(pg_src,"icustay_detail")
+## icustays_tbl <- tbl(pg_src,"icustays")
+## oasis_tbl  <- tbl(pg_src,"oasis")
+##
+## first_icu_tbl <- icustay_detail_tbl %>%  select(subject_id,hadm_id, icustay_id, gender,admittime_hospital=admittime,  
+##      dischtime_hospital=dischtime, los_hospital, admission_type, 
+##   hospital_expire_flag,intime_icu=intime,  outtime_icu=outtime, los_icu,age,hospstay_seq,icustay_seq) %>% 
+## left_join(icustays_tbl %>% select(icustay_id, first_careunit) ,by="icustay_id") %>% 
+##                filter(hospstay_seq==1,icustay_seq ==1,age>=16) %>% select(-hospstay_seq,-icustay_seq)
+
+## dat <- first_icu_tbl %>% 
+##    left_join(oasis_tbl %>% select(icustay_id,icustay_expire_flag, oasis, oasis_prob),by="icustay_id") %>% 
+##    collect(n=Inf)
+
+
+```
+
+
+# Check Data Extracted
+
+Always a good idea to inspect the data after you have extracted it. We will look at the first six patients (rows), and then check the number of rows, and get some summary statistics of the dataset.
+
+
+```{r}
+
+# Have a look at the dataset:
+head(dat)
+
+nrow(dat) #38557
+
+summary(dat)
+
+
+```
+
+# Add day of week to DataFrame
+
+If we are going to examine the weekend effect, we need to pull this out of the dataset, as you can see, all we have above are dates. We will define a weekend, as anytime between Saturday (00:00:00) until Sunday (23:59:59). The dates above are shifted, and that's why they look odd, but they are matched on the day of week, so this aspect is preserved.
+
+
+
+```{r}
+if(!("lubridate" %in% installed.packages())) { install.packages("lubridate")}
+
+library(lubridate)
+
+dat$dow <- as.factor(wday(dat$intime_icu ))
+table(dat$dow)
+# Convert to text levels
+levels(dat$dow) <- c("Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+table(dat$dow)
+
+dat$weekend <- dat$dow %in% c("Sunday","Saturday")
+table(dat$weekend)
+
+```
+
+
+# Produce some Summary Statistics by DOW and Weekday vs. Weekend
+
+Next, it's good to look at some basic summaries of the data. We will compute simple averages and percentages/counts for each of the variables we have extracted, and look at it by day of week (dow) and weekend (weekend).
+
+```{r}
+
+
+#If this fails, you may have to install pkg-config and libnlopt-dev on your system
+# e.g., in Ubuntu/Debian:
+# sudo apt-get install pkg-config  libnlopt-dev
+
+if(!("tableone" %in% installed.packages())) { install.packages("tableone")}
+
+library(tableone)
+
+vars <- c('gender', 'los_hospital', 'age', 'admission_type', 'hospital_expire_flag', 
+           'los_icu','icustay_expire_flag', 'oasis', 'oasis_prob', 'first_careunit')
+
+group_var <- "dow"
+
+CreateTableOne(dat,vars=vars,strata=group_var,factorVars=c("hospital_expire_flag","icustay_expire_flag")) %>% 
+      print(
+  printToggle      = FALSE,
+  showAllLevels    = TRUE,
+  cramVars         = "kon"
+) %>% 
+{data.frame(
+  variable_name             = gsub(" ", " ", rownames(.), fixed = TRUE), ., 
+  row.names        = NULL, 
+  check.names      = FALSE, 
+  stringsAsFactors = FALSE)} 
+
+
+```
+
+
+```{r}
+vars <- c('gender', 'los_hospital', 'age', 'admission_type', 'hospital_expire_flag', 
+           'los_icu','icustay_expire_flag', 'oasis', 'oasis_prob', 'first_careunit')
+
+group_var <- "weekend"
+
+CreateTableOne(dat,vars=vars,strata=group_var,factorVars=c("hospital_expire_flag","icustay_expire_flag")) %>% 
+      print(
+  printToggle      = FALSE,
+  showAllLevels    = TRUE,
+  cramVars         = "kon"
+) %>% 
+{data.frame(
+  variable_name             = gsub(" ", " ", rownames(.), fixed = TRUE), ., 
+  row.names        = NULL, 
+  check.names      = FALSE, 
+  stringsAsFactors = FALSE)} 
+
+```
+
+
+It looks like there's a higher rate of hospital mortality (14.0% vs 10.8%) and ICU mortality (10.2% vs 7.8%) on weekends when compared to weekdays. There are also statistically significant differences between several other important variables, including: admission type, disease severity (OASIS), and the patient's first care unit, suggesting that these groups may be fundamentally different in some way. Let's explore this a little further.
+
+
+```{r}
+library(ggplot2)
+
+dat %>% group_by(admission_type,dow) %>% 
+    summarise(n=n(),mortRate=mean(hospital_expire_flag==1),
+              LL95 = mortRate - qnorm(0.975)*sqrt(mortRate*(1-mortRate)/n),
+             UL95 = mortRate + qnorm(0.975)*sqrt(mortRate*(1-mortRate)/n)) %>%
+    ggplot(aes(dow,mortRate,group=admission_type,col=admission_type)) + 
+    geom_line() + 
+    geom_ribbon(aes(ymax=UL95,ymin=LL95,fill=admission_type,col=NULL),alpha=0.1) +
+    xlab("Day of Week") + ylab("Hospital Mortality Rate")
+
+
+```
+
+
+```{r}
+
+dat$weekend <- as.factor(dat$weekend)
+dat$admission_type <- as.factor(dat$admission_type)
+dat %>% group_by(admission_type,weekend) %>% 
+    summarise(n=n(),mortRate=mean(hospital_expire_flag==1),
+              LL95 = mortRate - qnorm(0.975)*sqrt(mortRate*(1-mortRate)/n),
+             UL95 = mortRate + qnorm(0.975)*sqrt(mortRate*(1-mortRate)/n)) %>%
+    ggplot(aes(weekend,mortRate,group=admission_type,col=admission_type)) + 
+    geom_line() + 
+    geom_ribbon(aes(ymax=UL95,ymin=LL95,fill=admission_type,col=NULL),alpha=0.1) +
+    xlab("Weekend") + ylab("Hospital Mortality Rate")
+```
+
+
+# Model Building
+
+Let's try to incorporate what we saw above into a very simple model. We will use logistic regression with hospital mortality as our outcome. First a unadjusted estimate, and then we will try to adjust for admission type.
+
+
+
+```{r}
+
+simple.glm <- glm(hospital_expire_flag ~ weekend,data=dat,family="binomial")
+summary(simple.glm)
+
+# Uncomment for pretty graph
+## if(!("sjPlot" %in% installed.packages())) { install.packages("sjPlot")}
+ #library(sjPlot)
+ #sjp.glm(simple.glm)
+```
+ 
+ 
+So, looking at the crude rates, and odds ratios, we can see that patients admitted on a weekend have about a 35% increase in the odds of dying in the hospital when compared to those on a weekday. This effect is statistically significant (p<0.001).
+
+Are we done?
+
+I hope not. We saw from the plots above, there is likely some confounding and effect modification going on. Continuing on....
+
+
+
+```{r}
+
+# Without effect modification
+adj.glm <- glm(hospital_expire_flag ~ weekend + admission_type,data=dat,family="binomial")
+summary(adj.glm)
+drop1(adj.glm,test="Chisq")
+
+# With effect modification (interaction)
+adj.int.glm <- glm(hospital_expire_flag ~ weekend*admission_type,data=dat,family="binomial")
+summary(adj.int.glm)
+drop1(adj.int.glm,test="Chisq")
+
+
+```
+
+
+```{r}
+
+onWeekend <- expand.grid(weekend="TRUE",admission_type=levels(dat$admission_type))
+onWeekday <- expand.grid(weekend="FALSE",admission_type=levels(dat$admission_type))
+
+onWeekend$pred <- predict(adj.int.glm,newdata=onWeekend)
+onWeekend 
+
+
+onWeekday$pred <- predict(adj.int.glm,newdata=onWeekday)
+onWeekday 
+
+```
+
+
+```{r}
+onWeekend %>% inner_join(onWeekday,by="admission_type") %>% mutate(OR=exp((pred.x-pred.y)))
+```
+
+So, this mirrors what we saw above. While there may be differences between EMERGENCY and URGENT admission types, an ELECTIVE admission occurring on a weekend has an odds of mortality almost four times that of an ELECTIVE admission on a weekday.
+
+What do you think? Do patients admitted on a weekend have a higher rate of mortality than those admitted during the week? Who is most effected, if at all?
+
+Looking forward to see what you guys come up with!
+
+
