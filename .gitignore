@@ -103,3 +103,5 @@ ENV/
 # password file
 *.pwfile_
 
+# OSX file
+.DS_Store
